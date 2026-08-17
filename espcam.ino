@@ -8,9 +8,7 @@
 #include "esp_timer.h"
 #define PWDN_GPIO_NUM   -1
 #define RESET_GPIO_NUM  -1
-
 #define XCLK_GPIO_NUM    5
-
 #define SIOD_GPIO_NUM    8
 #define SIOC_GPIO_NUM    9
 
@@ -28,12 +26,13 @@
 #define PCLK_GPIO_NUM    15
 
 
-const char* WIFI_SSID     = "veer";
-const char* WIFI_PASSWORD = "@12345678";
+const char* WIFI_SSID     = "TP-LINK_96B298";
+const char* WIFI_PASSWORD = "9258369415";
 const char* MQTT_HOST = "172.81.0.12";
 const uint16_t MQTT_PORT = 8883;
-const char* publish_topic = "device/test-device-2/scan";
+const char* publish_topic = "device/test-device-2/access/scan";
 const char* TLS_SERVER_NAME = "emqx.emqx.svc.cluster.local";
+const char* DUMMY_RFID_UID = "044F8A2C5E7180";
 
 
 const char* root_ca = \
@@ -427,38 +426,17 @@ void mqttCallback(
     Serial.print("Topic: ");
     Serial.println(topic);
 
-    Serial.print("Payload bytes: ");
-    Serial.println(length);
-
-    Serial.print("Payload preview: ");
+    Serial.print("Payload: ");
 
     for (
         unsigned int i = 0;
-        i < length && i < 64;
+        i < length;
         i++
     )
     {
-        char ch =
-            (char)payload[i];
-
-        if (
-            ch >= 32 &&
-            ch <= 126
-        )
-        {
-            Serial.print(ch);
-        }
-        else
-        {
-            Serial.print('.');
-        }
-    }
-
-    if (
-        length > 64
-    )
-    {
-        Serial.print("...");
+        Serial.print(
+            (char)payload[i]
+        );
     }
 
     Serial.println();
@@ -470,16 +448,19 @@ void mqttCallback(
 
 bool connectWiFi()
 {
-    Serial.print(
-        "Connecting to WiFi "
-    );
 
-    Serial.print(
-        WIFI_SSID
-    );
+    if (
+        WiFi.status() ==
+        WL_CONNECTED
+    )
+    {
+        return true;
+    }
 
-    Serial.print(
-        "..."
+
+    Serial.println();
+    Serial.println(
+        "Connecting to WiFi..."
     );
 
 
@@ -618,7 +599,6 @@ bool syncTime()
 
     return true;
 }
-
 bool connectMQTT()
 {
 
@@ -664,12 +644,15 @@ bool connectMQTT()
     IPAddress brokerIp;
 
     if (
-        !brokerIp.fromString(MQTT_HOST)
+        !WiFi.hostByName(
+            MQTT_HOST,
+            brokerIp
+        )
     )
     {
 
         Serial.println(
-            "Invalid broker IP"
+            "Failed to resolve broker host"
         );
 
         return false;
@@ -901,13 +884,15 @@ bool publishImage(
         publish_topic
     );
 
+    const uint16_t uidLen = (uint16_t)strlen(DUMMY_RFID_UID);
+    const size_t totalLen = 2 + (size_t)uidLen + fb->len;
 
     if (
         !mqttClient.beginPublish(
 
             publish_topic,
 
-            fb->len,
+            totalLen,
 
             false
 
@@ -922,38 +907,47 @@ bool publishImage(
         return false;
     }
 
-    size_t written =
-        mqttClient.write(
-            fb->buf,
-            fb->len
-        );
+    uint8_t lenBuf[2];
+    lenBuf[0] = (uint8_t)((uidLen >> 8) & 0xFF);
+    lenBuf[1] = (uint8_t)(uidLen & 0xFF);
 
-
-    if (
-        written != fb->len
-    )
+    size_t written = mqttClient.write(lenBuf, 2);
+    if (written != 2)
     {
-
-        Serial.print(
-            "MQTT write failed: "
-        );
-
-        Serial.print(
-            written
-        );
-
-        Serial.print(
-            "/"
-        );
-
-        Serial.println(
-            fb->len
-        );
-
-
+        Serial.print("MQTT write failed for UID length: ");
+        Serial.println(written);
         mqttClient.endPublish();
-
         return false;
+    }
+
+    written = mqttClient.write((const uint8_t*)DUMMY_RFID_UID, uidLen);
+    if (written != uidLen)
+    {
+        Serial.print("MQTT write failed for UID bytes: ");
+        Serial.println(written);
+        mqttClient.endPublish();
+        return false;
+    }
+
+    const size_t CHUNK = 1024;
+    size_t offset = 0;
+    size_t remaining = fb->len;
+
+    while (remaining > 0)
+    {
+        const size_t toWrite = remaining > CHUNK ? CHUNK : remaining;
+        size_t chunkWritten = mqttClient.write(fb->buf + offset, toWrite);
+
+        if (chunkWritten == 0)
+        {
+            Serial.print("MQTT image write failed at byte ");
+            Serial.println(offset);
+            mqttClient.endPublish();
+            return false;
+        }
+
+        offset += chunkWritten;
+        remaining -= chunkWritten;
     }
 
     if (
@@ -970,7 +964,7 @@ bool publishImage(
 
 
     Serial.println(
-        "JPEG published successfully"
+        "JPEG + RFID UID published successfully"
     );
 
 
@@ -1425,9 +1419,6 @@ void startCameraServer()
     config.server_port =
         81;
 
-    config.ctrl_port +=
-        1;
-
 
     httpd_uri_t streamUri = {
 
@@ -1441,14 +1432,11 @@ void startCameraServer()
     };
 
 
-    esp_err_t streamErr =
+    if (
         httpd_start(
             &stream_httpd,
             &config
-        );
-
-    if (
-        streamErr == ESP_OK
+        ) == ESP_OK
     )
     {
 
@@ -1457,16 +1445,6 @@ void startCameraServer()
             &streamUri
         );
 
-    }
-    else
-    {
-        Serial.print(
-            "Stream server start failed: "
-        );
-
-        Serial.println(
-            streamErr
-        );
     }
 
 
@@ -1661,7 +1639,8 @@ void setup()
         115200
     );
 
-    delay(1500);
+
+    delay(1000);
 
 
     Serial.println();
@@ -1698,10 +1677,6 @@ void setup()
 
     }
 
-    Serial.println(
-        "Camera init OK"
-    );
-
     if (
         !connectWiFi()
     )
@@ -1723,23 +1698,16 @@ void setup()
 
         syncTime();
 
-        if (
-            !connectMQTT()
-        )
-        {
-            Serial.println(
-                "Initial MQTT connect failed"
-            );
-        }
+    }
+    if (
+        WiFi.status() ==
+        WL_CONNECTED
+    )
+    {
 
-        if (
-            !publishHealthCheck()
-        )
-        {
-            Serial.println(
-                "Initial MQTT health check failed"
-            );
-        }
+        connectMQTT();
+
+        publishHealthCheck();
 
     }
 
@@ -1794,6 +1762,17 @@ void setup()
 
 void loop()
 {
+
+    if (
+        WiFi.status() !=
+        WL_CONNECTED
+    )
+    {
+
+        connectWiFi();
+
+    }
+
     if (
         WiFi.status() ==
         WL_CONNECTED
@@ -1804,6 +1783,7 @@ void loop()
             !mqttClient.connected()
         )
         {
+
             connectMQTT();
 
         }
